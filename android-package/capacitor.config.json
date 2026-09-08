@@ -1,0 +1,11 @@
+{
+  "appId": "com.kendellicias.app",
+  "appName": "Kendellícia's",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": false
+  }
+}
