@@ -4118,7 +4118,7 @@ function BottomNav({ screen, onHome, onVendas, onFinanceiro, onClientes, onAnota
 }
 
 const styles = {
-  page: { minHeight: "100vh", display: "flex", justifyContent: "center", alignItems: "flex-start", padding: "24px 12px", background: "#E7DCC8" },
+  page: { minHeight: "100vh", display: "flex", justifyContent: "center", alignItems: "flex-start", background: "#F4E9D8" },
 };
 
 const css = `
@@ -4126,7 +4126,37 @@ const css = `
 
 * { box-sizing: border-box; }
 
-.phone { position: relative; width: 390px; max-width: 100%; min-height: 800px; background: #F4E9D8; border-radius: 40px; overflow: hidden; box-shadow: 0 30px 60px -20px rgba(59, 35, 20, 0.35); font-family: 'Quicksand', sans-serif; color: #3B2314; display: flex; flex-direction: column; }
+html, body, #root { height: 100%; margin: 0; }
+
+.phone {
+  position: relative;
+  width: 100%;
+  max-width: 480px;
+  min-height: 100vh;
+  margin: 0 auto;
+  background: #F4E9D8;
+  overflow: hidden;
+  font-family: 'Quicksand', sans-serif;
+  color: #3B2314;
+  display: flex;
+  flex-direction: column;
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+/* Dentro do preview de navegador (tela larga), mantém o visual de "celular
+   emoldurado" para ficar bonito na demonstração — mas dentro do app Android
+   de verdade (tela estreita, é a tela toda) isso não se aplica, ele preenche
+   a tela inteira sem moldura. */
+@media (min-width: 560px) {
+  .page { padding: 24px 12px; background: #E7DCC8; }
+  .phone {
+    min-height: 800px;
+    border-radius: 40px;
+    box-shadow: 0 30px 60px -20px rgba(59, 35, 20, 0.35);
+  }
+}
+
 .screen { flex: 1; overflow-y: auto; padding-bottom: 100px; }
 .loading-screen { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; }
 .loading-text { font-family: 'Fraunces', serif; font-size: 14px; opacity: 0.7; }
