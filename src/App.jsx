@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, Component } from "react";
 import {
   ChefHat,
   Cookie,
@@ -116,6 +116,90 @@ const IndexedDbStorage = {
 };
 
 const AppStorage = HAS_CLAUDE_STORAGE ? window.storage : IndexedDbStorage;
+
+// ============================================================================
+// Ponte de arquivos nativa (Android/Capacitor). No navegador (preview do
+// Claude.ai ou build web comum), Blob + <a download> + Web Share API
+// funcionam direto. Dentro do APK gerado pelo Capacitor, o WebView do
+// Android NÃO tem acesso ao sistema de arquivos nem sabe renderizar PDF via
+// blob:, então essas mesmas chamadas silenciosamente não fazem nada — é
+// exatamente o bug relatado (comprovante não gera/abre/compartilha no APK).
+//
+// A correção usa os plugins oficiais @capacitor/filesystem e @capacitor/share:
+//   - Filesystem.writeFile grava o PDF em Directory.Cache (armazenamento
+//     privado do app), o que respeita o Scoped Storage do Android 10+ sem
+//     precisar pedir NENHUMA permissão de armazenamento.
+//   - Share.share pega esse arquivo e abre o menu nativo de compartilhamento
+//     do Android (WhatsApp, e-mail, "Salvar em Downloads"/Drive, etc.) — e
+//     por baixo dos panos usa um FileProvider (content://) que o próprio
+//     Capacitor já registra automaticamente no AndroidManifest da pasta
+//     android/ (authority "${applicationId}.fileprovider"). Não é preciso
+//     escrever XML de FileProvider à mão.
+//
+// IMPORTANTE (fazer uma vez no projeto, fora deste arquivo):
+//   npm install @capacitor/filesystem @capacitor/share
+//   npx cap sync android
+// ============================================================================
+function isNativePlatform() {
+  return (
+    typeof window !== "undefined" &&
+    !!window.Capacitor &&
+    typeof window.Capacitor.isNativePlatform === "function" &&
+    window.Capacitor.isNativePlatform()
+  );
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      // reader.result vem como "data:application/pdf;base64,AAAA..."
+      const base64 = String(reader.result).split(",")[1] || "";
+      resolve(base64);
+    };
+    reader.onerror = () => reject(reader.error || new Error("Falha ao ler o arquivo."));
+    reader.readAsDataURL(blob);
+  });
+}
+
+// Grava o blob em cache privado do app e abre o menu de compartilhar nativo
+// do Android. Usa a ponte window.Capacitor.Plugins (em vez de "import
+// @capacitor/filesystem/share") de propósito: essa ponte só depende do
+// plugin nativo estar presente no projeto Android (o que "npx cap sync"
+// resolve), e não de como o bundler do projeto empacota imports — evita
+// quebrar o build por um import não resolvido.
+async function saveAndShareNative(blob, filename) {
+  const plugins = window.Capacitor && window.Capacitor.Plugins;
+  const Filesystem = plugins && plugins.Filesystem;
+  const Share = plugins && plugins.Share;
+
+  if (!Filesystem || !Share) {
+    throw new Error(
+      "Os plugins nativos de arquivo/compartilhamento não estão instalados no app.\n" +
+        "No projeto: npm install @capacitor/filesystem @capacitor/share && npx cap sync android — depois gere o APK de novo."
+    );
+  }
+
+  const base64Data = await blobToBase64(blob);
+
+  await Filesystem.writeFile({
+    path: filename,
+    data: base64Data,
+    directory: "CACHE",
+    recursive: true,
+  });
+
+  const { uri } = await Filesystem.getUri({ directory: "CACHE", path: filename });
+
+  await Share.share({
+    title: filename,
+    text: filename,
+    url: uri,
+    dialogTitle: "Compartilhar ou salvar arquivo",
+  });
+
+  return uri;
+}
 
 function currency(v) {
   return v.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
@@ -464,15 +548,27 @@ function buildCobrancaPdf({ logoDataUri, titulo, clientName, periodo, items, tot
   return doc.toBlob();
 }
 
-function downloadOrShareBlob(blob, filename) {
-  const file = new File([blob], filename, { type: "application/pdf" });
-  if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
-    navigator.share({ files: [file], title: filename }).catch(() => {
-      triggerDownload(blob, filename);
-    });
-  } else {
-    triggerDownload(blob, filename);
+async function downloadOrShareBlob(blob, filename) {
+  if (isNativePlatform()) {
+    try {
+      await saveAndShareNative(blob, filename);
+    } catch (err) {
+      console.error("Falha ao salvar/compartilhar arquivo no Android:", err);
+      window.alert(`Não foi possível gerar "${filename}".\n\n${err?.message || err}`);
+    }
+    return;
   }
+
+  const file = new File([blob], filename, { type: blob.type || "application/pdf" });
+  if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: filename });
+      return;
+    } catch (err) {
+      // usuária cancelou ou falhou — cai no download abaixo
+    }
+  }
+  triggerDownload(blob, filename);
 }
 
 function triggerDownload(blob, filename) {
@@ -484,6 +580,52 @@ function triggerDownload(blob, filename) {
   a.click();
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+
+// ============================================================================
+// Blindagem contra tela em branco: se uma tela travar durante a
+// renderização (por exemplo, algo no WebView do Android que se comporta
+// diferente do navegador), o React normalmente desmonta a árvore inteira e
+// não sobra nada visível — é exatamente o sintoma de "não abre nada". Este
+// componente evita isso: mostra um aviso com o motivo do erro e um botão
+// para voltar, em vez de travar a tela em branco.
+// ============================================================================
+class ErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  componentDidCatch(error, info) {
+    console.error("Erro capturado pela ErrorBoundary:", error, info);
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="screen" style={{ padding: "20px" }}>
+          <p className="section-label" style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <AlertTriangle size={13} /> Essa tela travou
+          </p>
+          <p className="empty-hint" style={{ whiteSpace: "pre-line" }}>
+            {this.state.error?.message || String(this.state.error)}
+          </p>
+          <button
+            className="register-btn"
+            style={{ marginTop: 16 }}
+            onClick={() => {
+              this.setState({ error: null });
+              if (this.props.onReset) this.props.onReset();
+            }}
+          >
+            <HomeIcon size={16} /> Voltar ao início
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 export default function KendelliciasApp() {
@@ -875,7 +1017,7 @@ export default function KendelliciasApp() {
       plannedProducts, shoppingList, notes,
     };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-    triggerDownload(blob, `backup-kendellicias-${new Date().toLocaleDateString("pt-BR").replace(/\//g, "-")}.json`);
+    downloadOrShareBlob(blob, `backup-kendellicias-${new Date().toLocaleDateString("pt-BR").replace(/\//g, "-")}.json`);
   }
 
   function restoreBackup(data) {
@@ -928,6 +1070,7 @@ export default function KendelliciasApp() {
             <AlertTriangle size={13} /> Não foi possível salvar agora. Verifique a conexão.
           </div>
         )}
+        <ErrorBoundary onReset={() => goTo("home")}>
         {screen === "home" && (
           <Home
             session={session}
@@ -1070,6 +1213,7 @@ export default function KendelliciasApp() {
             onDeleteNote={deleteNote}
           />
         )}
+        </ErrorBoundary>
         <BottomNav
           screen={screen}
           onHome={() => goTo("home")}
@@ -1567,29 +1711,65 @@ function Comprovante({ receipt, pixConfig, onBack }) {
   const quitada = receipt.paidNow;
   const pixPayload = !quitada ? buildPixPayload({ ...pixConfig, amount: pendente }) : null;
 
-  const blob = buildCobrancaPdf({
-    logoDataUri: LOGO,
-    titulo: "Comprovante de venda",
-    clientName: receipt.clientName,
-    periodo: `${receipt.date} · ${receipt.time}`,
-    items: receipt.sales,
-    totalComprado: receipt.total,
-    totalPago: pago,
-    pendente,
-    quitada,
-    pixConfig,
-    pixPayload,
-  });
+  // Protegido com try/catch de propósito: se a montagem do PDF falhar por
+  // qualquer motivo, a tela do comprovante ainda mostra os dados da venda
+  // (que não dependem do PDF) em vez de travar em branco.
+  let blob = null;
+  let pdfBuildError = null;
+  try {
+    blob = buildCobrancaPdf({
+      logoDataUri: LOGO,
+      titulo: "Comprovante de venda",
+      clientName: receipt.clientName,
+      periodo: `${receipt.date} · ${receipt.time}`,
+      items: receipt.sales,
+      totalComprado: receipt.total,
+      totalPago: pago,
+      pendente,
+      quitada,
+      pixConfig,
+      pixPayload,
+    });
+  } catch (err) {
+    console.error("Falha ao montar o PDF do comprovante:", err);
+    pdfBuildError = err;
+  }
   const fileName = `comprovante-${receipt.clientName.replace(/\s+/g, "-")}.pdf`;
-  const pdfUrl = URL.createObjectURL(blob);
+  // Dentro do APK (Capacitor), URLs blob: não são visíveis fora da página —
+  // nem outro app consegue abri-las, nem o <embed> abaixo sabe renderizar
+  // PDF (o WebView do Android não tem visualizador de PDF embutido). Por
+  // isso só criamos essa pré-visualização em ambiente web.
+  const pdfUrl = blob && !isNativePlatform() ? URL.createObjectURL(blob) : null;
 
   useEffect(() => {
+    if (!pdfUrl) return;
     return () => URL.revokeObjectURL(pdfUrl);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function compartilhar() {
     setShareTried(true);
+    setShareFeedback("");
+
+    if (!blob) {
+      const msg = `Não consegui gerar o PDF do comprovante.\n\n${pdfBuildError?.message || pdfBuildError || "Erro desconhecido"}`;
+      setShareFeedback(msg);
+      window.alert(msg);
+      return;
+    }
+
+    if (isNativePlatform()) {
+      try {
+        await saveAndShareNative(blob, fileName);
+      } catch (err) {
+        console.error("Falha ao gerar/compartilhar comprovante:", err);
+        const msg = `Não foi possível gerar o comprovante.\n\n${err?.message || err}`;
+        setShareFeedback(msg);
+        window.alert(msg);
+      }
+      return;
+    }
+
     const file = new File([blob], fileName, { type: "application/pdf" });
     if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
       try {
@@ -1611,6 +1791,12 @@ function Comprovante({ receipt, pixConfig, onBack }) {
   return (
     <div className="screen">
       <TopBar title="Comprovante" onBack={onBack} />
+      {pdfBuildError && (
+        <p className="empty-hint" style={{ margin: "0 20px 10px", color: "#A85D2A", whiteSpace: "pre-line" }}>
+          ⚠️ Não consegui montar o arquivo PDF ({pdfBuildError.message || String(pdfBuildError)}). Os dados
+          da venda abaixo estão corretos mesmo assim.
+        </p>
+      )}
       <div className="boleto-card">
         <img src={LOGO} alt="Kendellícia's" className="boleto-logo" />
         <p className="boleto-brand">Kendellícia's · Brigadeiros &amp; Cia</p>
@@ -1652,33 +1838,43 @@ function Comprovante({ receipt, pixConfig, onBack }) {
         <button className="text-btn pdf-btn" onClick={compartilhar}>
           <Paperclip size={13} /> Compartilhar
         </button>
-        <a
-          className="text-btn pdf-btn"
-          href={pdfUrl}
-          download={fileName}
-          style={{ textDecoration: "none", display: "flex", alignItems: "center", justifyContent: "center" }}
-        >
-          <Download size={13} /> Salvar PDF
-        </a>
+        {isNativePlatform() || !blob ? (
+          <button className="text-btn pdf-btn" onClick={compartilhar}>
+            <Download size={13} /> Salvar PDF
+          </button>
+        ) : (
+          <a
+            className="text-btn pdf-btn"
+            href={pdfUrl}
+            download={fileName}
+            style={{ textDecoration: "none", display: "flex", alignItems: "center", justifyContent: "center" }}
+          >
+            <Download size={13} /> Salvar PDF
+          </a>
+        )}
       </div>
       {shareTried && shareFeedback && (
-        <p className="empty-hint" style={{ margin: "8px 20px 0" }}>{shareFeedback}</p>
+        <p className="empty-hint" style={{ margin: "8px 20px 0", whiteSpace: "pre-line" }}>{shareFeedback}</p>
       )}
 
       <button className="register-btn" style={{ margin: "18px 20px 0", width: "calc(100% - 40px)" }} onClick={onBack}>
         <HomeIcon size={16} /> Voltar ao início
       </button>
 
-      <p className="section-label" style={{ margin: "20px 20px 6px" }}>
-        Não conseguiu salvar pelos botões acima?
-      </p>
-      <div className="pdf-embed-wrap">
-        <embed src={pdfUrl} type="application/pdf" className="pdf-embed" />
-      </div>
-      <p className="empty-hint" style={{ margin: "6px 20px 20px" }}>
-        O PDF real está exibido acima — use o menu do seu navegador (ou toque e segure) para
-        salvá-lo diretamente daqui.
-      </p>
+      {!isNativePlatform() && blob && (
+        <>
+          <p className="section-label" style={{ margin: "20px 20px 6px" }}>
+            Não conseguiu salvar pelos botões acima?
+          </p>
+          <div className="pdf-embed-wrap">
+            <embed src={pdfUrl} type="application/pdf" className="pdf-embed" />
+          </div>
+          <p className="empty-hint" style={{ margin: "6px 20px 20px" }}>
+            O PDF real está exibido acima — use o menu do seu navegador (ou toque e segure) para
+            salvá-lo diretamente daqui.
+          </p>
+        </>
+      )}
     </div>
   );
 }
@@ -2837,6 +3033,15 @@ function ClientProfile({ client, sales, payments, pixConfig, onBack, onAddPaymen
     const periodo = datas.length ? `${datas[datas.length - 1]} a ${datas[0]}` : "—";
 
     function gerarPdf(tipo) {
+      try {
+        gerarPdfInterno(tipo);
+      } catch (err) {
+        console.error("Falha ao gerar PDF:", err);
+        window.alert(`Não foi possível gerar o PDF.\n\n${err?.message || err}`);
+      }
+    }
+
+    function gerarPdfInterno(tipo) {
       let items = compras;
       let total = totalComprado;
       let pago = totalPago;
@@ -2878,6 +3083,15 @@ function ClientProfile({ client, sales, payments, pixConfig, onBack, onAddPaymen
     }
 
     function gerarPdfMensal() {
+      try {
+        gerarPdfMensalInterno();
+      } catch (err) {
+        console.error("Falha ao gerar PDF mensal:", err);
+        window.alert(`Não foi possível gerar o PDF.\n\n${err?.message || err}`);
+      }
+    }
+
+    function gerarPdfMensalInterno() {
       const key = mesSelecionado;
       const vendasMes = compras.filter((s) => monthKeyOf(s.date) === key);
       const pagamentosMes = pagamentos.filter((p) => monthKeyOf(p.date) === key);
