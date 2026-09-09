@@ -25,6 +25,14 @@ jobs:
         run: |
           npx cap add android
           npx cap sync android
+      - name: Replace app icon with Kendellícia's logo
+        run: |
+          rm -rf android/app/src/main/res/mipmap-anydpi-v26
+          cp -f icons/mipmap-mdpi/ic_launcher.png icons/mipmap-mdpi/ic_launcher_round.png android/app/src/main/res/mipmap-mdpi/
+          cp -f icons/mipmap-hdpi/ic_launcher.png icons/mipmap-hdpi/ic_launcher_round.png android/app/src/main/res/mipmap-hdpi/
+          cp -f icons/mipmap-xhdpi/ic_launcher.png icons/mipmap-xhdpi/ic_launcher_round.png android/app/src/main/res/mipmap-xhdpi/
+          cp -f icons/mipmap-xxhdpi/ic_launcher.png icons/mipmap-xxhdpi/ic_launcher_round.png android/app/src/main/res/mipmap-xxhdpi/
+          cp -f icons/mipmap-xxxhdpi/ic_launcher.png icons/mipmap-xxxhdpi/ic_launcher_round.png android/app/src/main/res/mipmap-xxxhdpi/
       - name: Build Debug APK
         working-directory: ./android
         run: ./gradlew assembleDebug
